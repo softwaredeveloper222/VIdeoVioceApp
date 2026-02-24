@@ -1,0 +1,122 @@
+/* ─── Mobile Responsive ──────────────────────────────────── */
+
+/* Tablet */
+@media (max-width: 768px) {
+  .gradient-screen {
+    padding: 40px 28px !important;
+  }
+
+  .welcome-heading {
+    font-size: 28px !important;
+  }
+
+  .countdown-num {
+    font-size: 80px !important;
+  }
+
+  .bg-thumbs {
+    gap: 8px !important;
+  }
+
+  .bg-thumb {
+    width: 56px !important;
+    height: 40px !important;
+  }
+}
+
+/* Phone */
+@media (max-width: 480px) {
+  .gradient-screen {
+    padding: 32px 24px !important;
+  }
+
+  .welcome-heading {
+    font-size: 24px !important;
+  }
+
+  .logo {
+    margin-bottom: 0 !important;
+  }
+
+  .outline-btn,
+  .filled-btn {
+    padding: 14px 32px !important;
+    font-size: 11px !important;
+    letter-spacing: 0.14em !important;
+    min-height: 48px;
+  }
+
+  .camera-screen {
+    height: 100dvh !important;
+  }
+
+  .bottom-panel {
+    padding: 14px 20px 28px !important;
+  }
+
+  .bg-section {
+    margin-bottom: 16px !important;
+  }
+
+  .bg-thumbs {
+    gap: 6px !important;
+  }
+
+  .bg-thumb {
+    width: 48px !important;
+    height: 34px !important;
+    border-radius: 6px !important;
+  }
+
+  .record-btn {
+    width: 64px !important;
+    height: 64px !important;
+  }
+
+  .record-btn span:first-child {
+    width: 44px !important;
+    height: 44px !important;
+  }
+
+  .countdown-num {
+    font-size: 64px !important;
+  }
+
+  .email-prompt {
+    font-size: 16px !important;
+  }
+
+  .underline-input {
+    max-width: 260px !important;
+  }
+
+  .preview-btns {
+    flex-direction: column !important;
+    gap: 10px !important;
+  }
+
+  .preview-btns button {
+    width: 100% !important;
+    text-align: center;
+    justify-content: center;
+  }
+}
+
+/* Touch devices */
+@media (hover: none) and (pointer: coarse) {
+  .outline-btn,
+  .filled-btn,
+  .record-btn,
+  .bg-thumb {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .outline-btn:active,
+  .filled-btn:active {
+    transform: scale(0.97);
+  }
+
+  .record-btn:active {
+    transform: scale(0.94);
+  }
+}
