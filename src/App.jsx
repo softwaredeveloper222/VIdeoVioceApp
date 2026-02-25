@@ -87,7 +87,8 @@ void main() {
 const FRAG_SRC = `#version 300 es
 precision highp float;
 uniform sampler2D u_video;
-uniform sampler2D u_mask;
+uniform sampler2D u_mask;     // temporally blended mask — stable background/foreground
+uniform sampler2D u_rawMask;  // current-frame raw mask — zero temporal lag
 uniform sampler2D u_bg;
 uniform int u_mode;
 uniform vec2 u_texelSize;
@@ -98,31 +99,34 @@ void main() {
   vec4 vid = texture(u_video, v_uv);
   if (u_mode == 0) { fragColor = vid; return; }
 
-  // ── Gaussian blur + dilation (5×5, single pass) ───────────────────────────
-  // Both ops share the same 25 mask reads. Dilation (3×3 max) is tracked as a
-  // free by-product — no separate loop needed (saves 9 texture reads per pixel).
-  const float gw[5] = float[](0.0625, 0.25, 0.375, 0.25, 0.0625);
+  // ── 3×3 Gaussian + dilation on BLENDED mask ───────────────────────────────
+  // 3×3 (vs old 5×5) = thinner feather zone, reducing visible edge thickness.
+  // Each mask pixel is ~5 video pixels at 256→1280 scale; 3×3 covers ~15 video
+  // pixels across the boundary (5×5 was ~25), giving a noticeably slimmer edge.
+  const float gw3[3] = float[](0.25, 0.5, 0.25);
   float mBlur = 0.0;
   float mDilate = 0.0;
-  for (int dy = -2; dy <= 2; dy++) {
-    for (int dx = -2; dx <= 2; dx++) {
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
       float s = texture(u_mask, v_uv + vec2(float(dx), float(dy)) * u_maskTexelSize).r;
-      mBlur += s * gw[dx+2] * gw[dy+2];
-      if (abs(dx) <= 1 && abs(dy) <= 1) mDilate = max(mDilate, s);
+      mBlur += s * gw3[dx+1] * gw3[dy+1];
+      mDilate = max(mDilate, s);
     }
   }
-  float mFeat = max(mBlur, mDilate * 0.12);
+  float mFeat = max(mBlur, mDilate * 0.1);
 
-  // ── Guided filter 3×3 — snap edges to video colour boundaries ─────────────
-  // Reduced from 5×5 (50 reads) to 3×3 (18 reads): ~2.8× cheaper, same
-  // perceptual quality because the mask is already at 640×360 resolution.
+  // ── Guided filter 3×3 using RAW mask for P ────────────────────────────────
+  // KEY FIX: P is sampled from u_rawMask (current frame, no temporal blending).
+  // The linear model a·I + b is therefore fitted to where the boundary IS NOW,
+  // not where it was in the blended history. The resulting mGuided always snaps
+  // composite edges to the current video frame's colour boundary — zero lag.
   float guide = dot(vid.rgb, vec3(0.299, 0.587, 0.114));
   float sI = 0.0, sP = 0.0, sIP = 0.0, sII = 0.0;
   for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
       vec2 uv2 = v_uv + vec2(float(dx), float(dy)) * u_maskTexelSize;
       float I = dot(texture(u_video, uv2).rgb, vec3(0.299, 0.587, 0.114));
-      float P = texture(u_mask, uv2).r;
+      float P = texture(u_rawMask, uv2).r;
       sI += I; sP += P; sIP += I * P; sII += I * I;
     }
   }
@@ -133,9 +137,16 @@ void main() {
   float mGuided = clamp(a * guide + b, 0.0, 1.0);
 
   // ── Composite ─────────────────────────────────────────────────────────────
-  // 60 % guided (colour-boundary snapping) + 40 % Gaussian feather (soft edges).
-  float m = mix(mFeat, mGuided, 0.6);
-  m = smoothstep(0.15, 0.85, m);
+  // maskUncertainty peaks at 1 where mFeat ≈ 0.5 (the silhouette edge) and
+  // falls to 0 in confident foreground/background. At the edge: push guided
+  // weight to 1.0 so the boundary is fully current-frame-anchored (no lag).
+  // Away from the edge: 70 % guided + 30 % Gaussian gives soft feathering.
+  float maskUncertainty = 1.0 - abs(mFeat * 2.0 - 1.0);
+  float m = mix(mFeat, mGuided, 0.7 + maskUncertainty * 0.3);
+
+  // Tight smoothstep: 0.40–0.60 is a 0.20-unit band (old 0.15–0.85 = 0.70).
+  // Reduces visible edge thickness to ~3–4 video pixels on typical hardware.
+  m = smoothstep(0.40, 0.60, m);
 
   vec4 bg = texture(u_bg, v_uv);
   fragColor = mix(bg, vid, m);
@@ -203,7 +214,8 @@ function initWebGL(gl) {
 
   // Textures
   const videoTex = createGLTexture(gl, gl.LINEAR);
-  const maskTex = createGLTexture(gl, maskFilter);
+  const maskTex = createGLTexture(gl, maskFilter);      // unit 1 — blended mask
+  const rawMaskTex = createGLTexture(gl, maskFilter);   // unit 3 — current-frame raw mask
   const bgTex = createGLTexture(gl, gl.LINEAR);
   // Dark fallback so unloaded backgrounds don't show garbage
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([26, 26, 46, 255]));
@@ -213,6 +225,7 @@ function initWebGL(gl) {
   const uniforms = {
     u_video: gl.getUniformLocation(program, "u_video"),
     u_mask: gl.getUniformLocation(program, "u_mask"),
+    u_rawMask: gl.getUniformLocation(program, "u_rawMask"),
     u_bg: gl.getUniformLocation(program, "u_bg"),
     u_mode: gl.getUniformLocation(program, "u_mode"),
     u_texelSize: gl.getUniformLocation(program, "u_texelSize"),
@@ -221,13 +234,14 @@ function initWebGL(gl) {
   gl.uniform1i(uniforms.u_video, 0);
   gl.uniform1i(uniforms.u_mask, 1);
   gl.uniform1i(uniforms.u_bg, 2);
+  gl.uniform1i(uniforms.u_rawMask, 3);
 
   // Set mask texel size once — mask is always SEG_WIDTH×SEG_HEIGHT regardless
   // of the video resolution, so this is a true constant for the shader.
   const u_maskTexelSizeLoc = gl.getUniformLocation(program, "u_maskTexelSize");
   gl.uniform2f(u_maskTexelSizeLoc, 1.0 / SEG_WIDTH, 1.0 / SEG_HEIGHT);
 
-  return { program, vao, buf, textures: { video: videoTex, mask: maskTex, bg: bgTex }, uniforms };
+  return { program, vao, buf, textures: { video: videoTex, mask: maskTex, rawMask: rawMaskTex, bg: bgTex }, uniforms };
 }
 
 // ─── WebGL background compositing with ML segmentation ────────
@@ -339,9 +353,21 @@ function useBackgroundEffect(videoRef, canvasRef, selectedBg, segmenterRef, segm
         } catch { /* fall through */ }
 
         if (mask) {
-          // Motion-aware temporal blending: adapts smoothing to movement.
-          // Fast motion → more current mask (less ghosting).
-          // Slow/no motion → more blending (less flicker).
+          // ── Upload raw mask to texture unit 3 FIRST (before any blending) ──
+          // The shader's guided filter reads u_rawMask for its P samples so its
+          // linear model is fitted to the boundary's current position — zero lag.
+          gl.activeTexture(gl.TEXTURE3);
+          gl.bindTexture(gl.TEXTURE_2D, r.textures.rawMask);
+          if (maskAllocRef.current.w !== SEG_WIDTH || maskAllocRef.current.h !== SEG_HEIGHT) {
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, SEG_WIDTH, SEG_HEIGHT, 0, gl.RED, gl.FLOAT, mask);
+          } else {
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, SEG_WIDTH, SEG_HEIGHT, gl.RED, gl.FLOAT, mask);
+          }
+
+          // ── Per-pixel boundary-aware temporal blend → texture unit 1 ───────
+          // globalAlpha: low when static (stable BG/FG), high during motion.
+          // localAlpha: at boundary pixels (mask ≈ 0.5) always → 0.97 so the
+          // silhouette edge tracks without lag in the blended mask too.
           const prev = blendMaskRef.current;
           const hasPrev = prev && prev.length === mask.length;
           if (!hasPrev) {
@@ -352,10 +378,13 @@ function useBackgroundEffect(videoRef, canvasRef, selectedBg, segmenterRef, segm
               diff += Math.abs(mask[i] - prev[i]);
             }
             diff /= (mask.length >> 4);
-            const alpha = Math.min(0.92, 0.6 + diff * 4.0);
+            const globalAlpha = Math.min(0.9, 0.15 + diff * 6.0);
             const blend = blendMaskRef.current;
             for (let i = 0; i < mask.length; i++) {
-              blend[i] = mask[i] * alpha + blend[i] * (1.0 - alpha);
+              const curr = mask[i];
+              const uncertainty = 1.0 - Math.abs(curr * 2.0 - 1.0);
+              const localAlpha = globalAlpha + uncertainty * (0.97 - globalAlpha);
+              blend[i] = curr * localAlpha + blend[i] * (1.0 - localAlpha);
             }
           }
 
@@ -370,11 +399,11 @@ function useBackgroundEffect(videoRef, canvasRef, selectedBg, segmenterRef, segm
           hasMaskRef.current = true;
         }
 
-        // Adaptive load management: adjust segmentation frequency based on cost
+        // Adaptive load management — keep skip interval at 1 for most devices
         const segTime = performance.now() - segStart;
         const avg = avgFrameTimeRef.current = avgFrameTimeRef.current * 0.9 + segTime * 0.1;
-        if (avg > 18 && skipIntervalRef.current < 4) skipIntervalRef.current++;
-        else if (avg < 8 && skipIntervalRef.current > 1) skipIntervalRef.current--;
+        if (avg > 8 && skipIntervalRef.current < 4) skipIntervalRef.current++;
+        else if (avg < 3 && skipIntervalRef.current > 1) skipIntervalRef.current--;
       }
 
       // No valid mask yet — passthrough until first segmentation completes
@@ -488,7 +517,7 @@ function RecordScreen({ onNext, onBack }) {
   const [phase, setPhase] = useState("setup");
   const [countdown, setCountdown] = useState(3);
   const [elapsed, setElapsed] = useState(0);
-  const [selectedBg, setSelectedBg] = useState("living-room");
+  const [selectedBg, setSelectedBg] = useState("none");
   const [recordedBlob, setRecordedBlob] = useState(null);
   const [recordedUrl, setRecordedUrl] = useState(null);
   const [cameraReady, setCameraReady] = useState(false);
@@ -1070,8 +1099,8 @@ const styles = {
     position: "relative",
   },
   cameraView: {
-    flex: 1,
-    position: "relative",
+    position: "absolute",
+    inset: 0,
     overflow: "hidden",
     background: "#000",
   },
@@ -1192,11 +1221,15 @@ const styles = {
     transition: "width 1s linear",
   },
 
-  // ─── Bottom panel (camera screen)
+  // ─── Bottom panel (camera screen) — floats over the camera feed
   bottomPanel: {
-    background: "#0a0e1a",
-    padding: "16px 24px 32px",
-    flexShrink: 0,
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    background: "linear-gradient(to top, rgba(0,0,0,0.45) 60%, transparent)",
+    padding: "32px 24px 36px",
+    zIndex: 10,
   },
 
   // ─── Background picker
