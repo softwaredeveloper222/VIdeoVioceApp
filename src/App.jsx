@@ -4,13 +4,13 @@ const GRADIENT_BG = "linear-gradient(155deg, #0a1628 0%, #162052 20%, #3b1760 45
 
 // ─── MediaPipe Configuration ──────────────────────────────────
 const MEDIAPIPE_WASM_CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.32/wasm";
-const SELFIE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
+const SELFIE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter_landscape/float16/latest/selfie_segmenter_landscape.tflite";
 
-// Segmentation runs on a downscaled canvas for performance.
-// 1280×720 → 640×360 = 4× fewer pixels for ML inference.
-// GPU bilinear interpolation upscales the mask in the shader.
-const SEG_WIDTH = 640;
-const SEG_HEIGHT = 360;
+// Landscape model native input resolution — 256×144 (16:9).
+// Running segmentation at native resolution avoids internal rescaling;
+// the joint bilateral shader upsamples to full video resolution in the GPU.
+const SEG_WIDTH = 256;
+const SEG_HEIGHT = 144;
 
 const BACKGROUNDS = [
   { id: "none", label: "None", type: "none", preview: "#1a1a2e" },
@@ -41,14 +41,14 @@ function useSegmenter() {
         try {
           segmenter = await ImageSegmenter.createFromOptions(vision, {
             baseOptions: { modelAssetPath: SELFIE_MODEL_URL, delegate: "GPU" },
-            runningMode: "VIDEO",
+            runningMode: "IMAGE", // IMAGE mode: raw per-frame output, no internal temporal lag
             outputConfidenceMasks: true,
             outputCategoryMask: false,
           });
         } catch {
           segmenter = await ImageSegmenter.createFromOptions(vision, {
             baseOptions: { modelAssetPath: SELFIE_MODEL_URL, delegate: "CPU" },
-            runningMode: "VIDEO",
+            runningMode: "IMAGE",
             outputConfidenceMasks: true,
             outputCategoryMask: false,
           });
@@ -87,66 +87,83 @@ void main() {
 const FRAG_SRC = `#version 300 es
 precision highp float;
 uniform sampler2D u_video;
-uniform sampler2D u_mask;     // temporally blended mask — stable background/foreground
-uniform sampler2D u_rawMask;  // current-frame raw mask — zero temporal lag
+uniform sampler2D u_mask;     // EMA-smoothed mask  — stable bg/fg, no flicker
+uniform sampler2D u_rawMask;  // current-frame mask — zero temporal lag
 uniform sampler2D u_bg;
 uniform int u_mode;
-uniform vec2 u_texelSize;
-uniform vec2 u_maskTexelSize;
+uniform vec2 u_texelSize;     // full-res video texel (1/W, 1/H) — for Sobel
+uniform vec2 u_maskTexelSize; // mask-space texel  (1/256, 1/144)
 in vec2 v_uv;
 out vec4 fragColor;
+
 void main() {
   vec4 vid = texture(u_video, v_uv);
   if (u_mode == 0) { fragColor = vid; return; }
 
-  // ── 3×3 Gaussian + dilation on BLENDED mask ───────────────────────────────
-  // 3×3 (vs old 5×5) = thinner feather zone, reducing visible edge thickness.
-  // Each mask pixel is ~5 video pixels at 256→1280 scale; 3×3 covers ~15 video
-  // pixels across the boundary (5×5 was ~25), giving a noticeably slimmer edge.
-  const float gw3[3] = float[](0.25, 0.5, 0.25);
-  float mBlur = 0.0;
-  float mDilate = 0.0;
+  const vec3 luma = vec3(0.299, 0.587, 0.114);
+
+  // ── Pass 1: Joint Bilateral Upsampling ────────────────────────────────────
+  // Upsamples the 256×144 mask to full video resolution. Each of the 9
+  // mask-space neighbours is weighted by:
+  //   w = spatial_gauss(d) × range_gauss(ΔL)
+  // The colour-similarity gate (range_gauss) makes the boundary automatically
+  // snap to colour edges in the full-res video — no separate guided filter needed.
+  //
+  // Two masks share the same 9 video reads (27 total texture reads):
+  //   mRaw   ← u_rawMask: current frame, zero lag → dominates at moving edge
+  //   mBlend ← u_mask:    EMA-smoothed   → stable in confident bg/fg
+  float lumC  = dot(vid.rgb, luma);
+  float totalW = 0.0;
+  float mRaw = 0.0, mBlend = 0.0;
   for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
-      float s = texture(u_mask, v_uv + vec2(float(dx), float(dy)) * u_maskTexelSize).r;
-      mBlur += s * gw3[dx+1] * gw3[dy+1];
-      mDilate = max(mDilate, s);
+      vec2  mUV   = v_uv + vec2(float(dx), float(dy)) * u_maskTexelSize;
+      float rawV  = texture(u_rawMask, mUV).r;
+      float blndV = texture(u_mask,    mUV).r;
+      float lumN  = dot(texture(u_video, mUV).rgb, luma);
+      float wS = exp(-float(dx*dx + dy*dy) * 0.5); // spatial σ = 1 mask px
+      float dL = lumN - lumC;
+      float wR = exp(-dL * dL * 35.0);             // range  σ ≈ 0.12 luma — tighter = sharper boundary
+      float w  = wS * wR;
+      mRaw   += rawV  * w;
+      mBlend += blndV * w;
+      totalW += w;
     }
   }
-  float mFeat = max(mBlur, mDilate * 0.1);
+  mRaw   /= totalW;
+  mBlend /= totalW;
 
-  // ── Guided filter 3×3 using RAW mask for P ────────────────────────────────
-  // KEY FIX: P is sampled from u_rawMask (current frame, no temporal blending).
-  // The linear model a·I + b is therefore fitted to where the boundary IS NOW,
-  // not where it was in the blended history. The resulting mGuided always snaps
-  // composite edges to the current video frame's colour boundary — zero lag.
-  float guide = dot(vid.rgb, vec3(0.299, 0.587, 0.114));
-  float sI = 0.0, sP = 0.0, sIP = 0.0, sII = 0.0;
-  for (int dy = -1; dy <= 1; dy++) {
-    for (int dx = -1; dx <= 1; dx++) {
-      vec2 uv2 = v_uv + vec2(float(dx), float(dy)) * u_maskTexelSize;
-      float I = dot(texture(u_video, uv2).rgb, vec3(0.299, 0.587, 0.114));
-      float P = texture(u_rawMask, uv2).r;
-      sI += I; sP += P; sIP += I * P; sII += I * I;
-    }
-  }
-  float n = 9.0;
-  float mI = sI / n, mP = sP / n;
-  float a = (sIP / n - mI * mP) / (sII / n - mI * mI + 0.02);
-  float b = mP - a * mI;
-  float mGuided = clamp(a * guide + b, 0.0, 1.0);
+  // ── Pass 2: Boundary-aware raw / blend mix ────────────────────────────────
+  // uncertainty = 1 at the silhouette edge (mRaw ≈ 0.5), 0 in solid regions.
+  // Multiplied by 2.0 so any pixel with mRaw in [0.25, 0.75] fully uses mRaw.
+  // This widens the zero-lag zone to the full soft transition band, eliminating
+  // the partial-lag bleed that caused visible boundary delay during motion.
+  float uncertainty = 1.0 - abs(mRaw * 2.0 - 1.0);
+  float m = mix(mBlend, mRaw, clamp(uncertainty * 2.0, 0.0, 1.0));
 
-  // ── Composite ─────────────────────────────────────────────────────────────
-  // maskUncertainty peaks at 1 where mFeat ≈ 0.5 (the silhouette edge) and
-  // falls to 0 in confident foreground/background. At the edge: push guided
-  // weight to 1.0 so the boundary is fully current-frame-anchored (no lag).
-  // Away from the edge: 70 % guided + 30 % Gaussian gives soft feathering.
-  float maskUncertainty = 1.0 - abs(mFeat * 2.0 - 1.0);
-  float m = mix(mFeat, mGuided, 0.7 + maskUncertainty * 0.3);
+  // ── Pass 3: Full-resolution video-space edge snap (Sobel) ─────────────────
+  // The bilateral mask is at 256×144 — each pixel covers ~5 full video pixels.
+  // Even perfect bilateral upsampling leaves a soft ~5px transition band.
+  // This pass reads 4 adjacent FULL-RESOLUTION video pixels, computes the local
+  // colour gradient (Sobel magnitude), and at strong gradients in the uncertain
+  // zone snaps the composite mask to the nearest binary side (0 or 1).
+  // Result: pixel-accurate boundary detail aligned with actual colour edges
+  // in the full video — detail that the low-res mask alone cannot provide.
+  float lumR = dot(texture(u_video, v_uv + vec2( u_texelSize.x, 0.0)).rgb, luma);
+  float lumL = dot(texture(u_video, v_uv + vec2(-u_texelSize.x, 0.0)).rgb, luma);
+  float lumU = dot(texture(u_video, v_uv + vec2(0.0,  u_texelSize.y)).rgb, luma);
+  float lumD = dot(texture(u_video, v_uv + vec2(0.0, -u_texelSize.y)).rgb, luma);
+  // Sobel gradient magnitude, scaled so ~0.08 luma/px change → full snap
+  float videoEdge = clamp(length(vec2(lumR - lumL, lumU - lumD)) * 7.0, 0.0, 1.0);
+  // Snap: at high-contrast video edges in the uncertain zone → push to 0 or 1
+  float mSnap = step(0.5, m);
+  m = mix(m, mSnap, videoEdge * uncertainty * 0.85);
 
-  // Tight smoothstep: 0.40–0.60 is a 0.20-unit band (old 0.15–0.85 = 0.70).
-  // Reduces visible edge thickness to ~3–4 video pixels on typical hardware.
-  m = smoothstep(0.40, 0.60, m);
+  // ── Final feather ─────────────────────────────────────────────────────────
+  // Smoothstep over a moderate band. The Sobel snap has already hardened most
+  // high-contrast edges; the remaining soft region gives natural feathering for
+  // low-contrast areas (hair over similar-colour walls, fine fabric edges).
+  m = smoothstep(0.33, 0.67, m);
 
   vec4 bg = texture(u_bg, v_uv);
   fragColor = mix(bg, vid, m);
@@ -257,7 +274,6 @@ function useBackgroundEffect(videoRef, canvasRef, selectedBg, segmenterRef, segm
   const rendererRef = useRef(null);
   const blurCanvasRef = useRef(null);
   const blurCtxRef = useRef(null);
-  const lastTimeRef = useRef(0);
   const animFrameRef = useRef(null);
   const lastDimsRef = useRef({ w: 0, h: 0 });
   const lastBgKeyRef = useRef(null);
@@ -268,7 +284,7 @@ function useBackgroundEffect(videoRef, canvasRef, selectedBg, segmenterRef, segm
   const segCtxRef = useRef(null);
   const blendMaskRef = useRef(null);
   const avgFrameTimeRef = useRef(16);
-  const skipIntervalRef = useRef(2);
+  const skipIntervalRef = useRef(1);
 
   // Initialize WebGL once, draw loop reads from refs
   useEffect(() => {
@@ -331,22 +347,20 @@ function useBackgroundEffect(videoRef, canvasRef, selectedBg, segmenterRef, segm
         return;
       }
 
-      // Run ML segmentation on a downscaled canvas at adaptive intervals.
-      // 1280×720 → 640×360 = 4× fewer pixels. Skip interval adapts to device (1–4 frames).
+      // Run ML segmentation on the 256×144 canvas at adaptive intervals.
+      // 1280×720 → 256×144 = 25× fewer pixels. Skip interval adapts to device (1–2 frames).
       frameCountRef.current++;
       const shouldSegment = frameCountRef.current % skipIntervalRef.current === 0;
 
       if (shouldSegment) {
         const segStart = performance.now();
-        const timestamp = segStart > lastTimeRef.current ? segStart : lastTimeRef.current + 1;
-        lastTimeRef.current = timestamp;
 
         // Draw video to small canvas for fast segmentation
         segCtxRef.current.drawImage(video, 0, 0, SEG_WIDTH, SEG_HEIGHT);
 
         let mask = null;
         try {
-          const result = segmenterRef.current.segmentForVideo(segCanvasRef.current, timestamp);
+          const result = segmenterRef.current.segment(segCanvasRef.current);
           if (result.confidenceMasks?.length > 0) {
             mask = result.confidenceMasks[0].getAsFloat32Array();
           }
@@ -383,7 +397,7 @@ function useBackgroundEffect(videoRef, canvasRef, selectedBg, segmenterRef, segm
             for (let i = 0; i < mask.length; i++) {
               const curr = mask[i];
               const uncertainty = 1.0 - Math.abs(curr * 2.0 - 1.0);
-              const localAlpha = globalAlpha + uncertainty * (0.97 - globalAlpha);
+              const localAlpha = globalAlpha + uncertainty * (1.0 - globalAlpha); // boundary pixels: localAlpha = 1.0 (exact current frame, zero lag)
               blend[i] = curr * localAlpha + blend[i] * (1.0 - localAlpha);
             }
           }
@@ -402,7 +416,7 @@ function useBackgroundEffect(videoRef, canvasRef, selectedBg, segmenterRef, segm
         // Adaptive load management — keep skip interval at 1 for most devices
         const segTime = performance.now() - segStart;
         const avg = avgFrameTimeRef.current = avgFrameTimeRef.current * 0.9 + segTime * 0.1;
-        if (avg > 8 && skipIntervalRef.current < 4) skipIntervalRef.current++;
+        if (avg > 8 && skipIntervalRef.current < 2) skipIntervalRef.current++; // cap at 2 — max 1 stale frame
         else if (avg < 3 && skipIntervalRef.current > 1) skipIntervalRef.current--;
       }
 
