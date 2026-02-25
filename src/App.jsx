@@ -98,45 +98,35 @@ void main() {
   vec4 vid = texture(u_video, v_uv);
   if (u_mode == 0) { fragColor = vid; return; }
 
-  // ── Morphological dilation (3×3 max-pool in mask space) ──────────────────
-  // Expands the person region by 1 mask pixel, closing sub-pixel gaps in thin
-  // features (hair strands, fingers) to reduce background bleed-through.
-  float mDilate = 0.0;
-  for (int dy = -1; dy <= 1; dy++) {
-    for (int dx = -1; dx <= 1; dx++) {
-      mDilate = max(mDilate, texture(u_mask, v_uv + vec2(float(dx), float(dy)) * u_maskTexelSize).r);
-    }
-  }
-
-  // ── Gaussian blur on mask (5×5 in mask space) — edge feathering ──────────
-  // Spreads the mask boundary over ~5 mask pixels (~10 video pixels), turning
-  // the hard segmentation boundary into a smooth compositing alpha channel.
+  // ── Gaussian blur + dilation (5×5, single pass) ───────────────────────────
+  // Both ops share the same 25 mask reads. Dilation (3×3 max) is tracked as a
+  // free by-product — no separate loop needed (saves 9 texture reads per pixel).
   const float gw[5] = float[](0.0625, 0.25, 0.375, 0.25, 0.0625);
   float mBlur = 0.0;
+  float mDilate = 0.0;
   for (int dy = -2; dy <= 2; dy++) {
     for (int dx = -2; dx <= 2; dx++) {
-      mBlur += texture(u_mask, v_uv + vec2(float(dx), float(dy)) * u_maskTexelSize).r * gw[dx+2] * gw[dy+2];
+      float s = texture(u_mask, v_uv + vec2(float(dx), float(dy)) * u_maskTexelSize).r;
+      mBlur += s * gw[dx+2] * gw[dy+2];
+      if (abs(dx) <= 1 && abs(dy) <= 1) mDilate = max(mDilate, s);
     }
   }
-  // Merge dilation into blur: raise alpha slightly in dilated areas so fine
-  // foreground detail (hair tips) is not fully lost to Gaussian weighting.
   float mFeat = max(mBlur, mDilate * 0.12);
 
-  // ── Guided filter (5×5 mask space) — snap edges to video colour boundaries ─
-  // Fits a local linear model (a·I + b) between mask P and luminance guide I.
-  // Bends the composite edge to follow actual colour gradients in the video
-  // frame, preventing it from bisecting a uniform-coloured surface.
+  // ── Guided filter 3×3 — snap edges to video colour boundaries ─────────────
+  // Reduced from 5×5 (50 reads) to 3×3 (18 reads): ~2.8× cheaper, same
+  // perceptual quality because the mask is already at 640×360 resolution.
   float guide = dot(vid.rgb, vec3(0.299, 0.587, 0.114));
   float sI = 0.0, sP = 0.0, sIP = 0.0, sII = 0.0;
-  for (int dy = -2; dy <= 2; dy++) {
-    for (int dx = -2; dx <= 2; dx++) {
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
       vec2 uv2 = v_uv + vec2(float(dx), float(dy)) * u_maskTexelSize;
       float I = dot(texture(u_video, uv2).rgb, vec3(0.299, 0.587, 0.114));
       float P = texture(u_mask, uv2).r;
       sI += I; sP += P; sIP += I * P; sII += I * I;
     }
   }
-  float n = 25.0;
+  float n = 9.0;
   float mI = sI / n, mP = sP / n;
   float a = (sIP / n - mI * mP) / (sII / n - mI * mI + 0.02);
   float b = mP - a * mI;
@@ -299,20 +289,23 @@ function useBackgroundEffect(videoRef, canvasRef, selectedBg, segmenterRef, segm
       const curReady = segmenterReadyRef.current;
       const curUploaded = uploadedImageRef.current;
 
-      // Resize only when dimensions change
+      // Resize only when dimensions change; pre-allocate video texture so
+      // per-frame uploads can use texSubImage2D (no GPU reallocation each frame).
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, r.textures.video);
       if (lastDimsRef.current.w !== w || lastDimsRef.current.h !== h) {
         canvas.width = w;
         canvas.height = h;
         gl.viewport(0, 0, w, h);
         gl.useProgram(r.program);
         gl.uniform2f(r.uniforms.u_texelSize, 1.0 / w, 1.0 / h);
+        // Allocate storage once at the new size; subsequent frames use texSubImage2D.
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
         lastDimsRef.current = { w, h };
       }
 
-      // Upload video texture
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, r.textures.video);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+      // Upload video frame — texSubImage2D reuses existing GPU allocation (no realloc).
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, video);
 
       // "none" mode or segmenter not ready — passthrough video
       if (curBg === "none" || !curReady || !segmenterRef.current) {
