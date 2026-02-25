@@ -12,6 +12,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.32",
     "concurrently": "^9.1.2",
     "express": "^5.1.0",
     "multer": "^2.0.2",

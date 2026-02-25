@@ -2,73 +2,435 @@ import { useState, useRef, useEffect, useCallback } from "react";
 
 const GRADIENT_BG = "linear-gradient(155deg, #0a1628 0%, #162052 20%, #3b1760 45%, #7b1a5e 70%, #c2185b 95%)";
 
+// ─── MediaPipe Configuration ──────────────────────────────────
+const MEDIAPIPE_WASM_CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.32/wasm";
+const SELFIE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
+
+// Segmentation runs on a downscaled canvas for performance.
+// 1280×720 → 640×360 = 4× fewer pixels for ML inference.
+// GPU bilinear interpolation upscales the mask in the shader.
+const SEG_WIDTH = 640;
+const SEG_HEIGHT = 360;
+
 const BACKGROUNDS = [
-  { id: "none", label: "None", color: null, preview: "#1a1a2e" },
-  { id: "blur", label: "Blur", color: null, preview: "linear-gradient(135deg, #667eea, #764ba2)" },
-  { id: "gradient1", label: "Sunset", color: "linear-gradient(135deg, #f093fb 0%, #f5576c 100%)", preview: "linear-gradient(135deg, #f093fb, #f5576c)" },
-  { id: "gradient2", label: "Ocean", color: "linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)", preview: "linear-gradient(135deg, #4facfe, #00f2fe)" },
-  { id: "gradient3", label: "Forest", color: "linear-gradient(135deg, #0ba360 0%, #3cba92 100%)", preview: "linear-gradient(135deg, #0ba360, #3cba92)" },
-  { id: "warm", label: "Warm", color: "linear-gradient(135deg, #f6d365 0%, #fda085 100%)", preview: "linear-gradient(135deg, #f6d365, #fda085)" },
+  { id: "none", label: "None", type: "none", preview: "#1a1a2e" },
+  { id: "living-room", label: "Living Room", type: "image", src: "/backgrounds/living-room.jpg", preview: "linear-gradient(135deg, #c8956a, #f0ebe0)" },
+  { id: "home-office", label: "Home Office", type: "image", src: "/backgrounds/home-office.jpg", preview: "linear-gradient(135deg, #7a9ab0, #e8ecf0)" },
+  { id: "library", label: "Library", type: "image", src: "/backgrounds/library.jpg", preview: "linear-gradient(135deg, #7a5c3c, #c8a050)" },
+  { id: "cafe", label: "Cafe", type: "image", src: "/backgrounds/cafe.jpg", preview: "linear-gradient(135deg, #b07850, #e8d090)" },
+  { id: "upload", label: "Custom", type: "upload", preview: "linear-gradient(135deg, #333, #666)" },
 ];
 
 const MAX_DURATION = 30;
 
-// Canvas background compositing
-function useBackgroundEffect(videoRef, canvasRef, selectedBg) {
-  const animFrameRef = useRef(null);
-  const ctxRef = useRef(null);
+// ─── MediaPipe Segmenter Hook ─────────────────────────────────
+function useSegmenter() {
+  const segmenterRef = useRef(null);
+  const [segmenterReady, setSegmenterReady] = useState(false);
+  const [segmenterError, setSegmenterError] = useState(null);
 
   useEffect(() => {
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas) return;
+    let cancelled = false;
 
-    ctxRef.current = canvas.getContext("2d", { willReadFrequently: true });
+    async function init() {
+      try {
+        const { FilesetResolver, ImageSegmenter } = await import("@mediapipe/tasks-vision");
+        const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_CDN);
+
+        let segmenter;
+        try {
+          segmenter = await ImageSegmenter.createFromOptions(vision, {
+            baseOptions: { modelAssetPath: SELFIE_MODEL_URL, delegate: "GPU" },
+            runningMode: "VIDEO",
+            outputConfidenceMasks: true,
+            outputCategoryMask: false,
+          });
+        } catch {
+          segmenter = await ImageSegmenter.createFromOptions(vision, {
+            baseOptions: { modelAssetPath: SELFIE_MODEL_URL, delegate: "CPU" },
+            runningMode: "VIDEO",
+            outputConfidenceMasks: true,
+            outputCategoryMask: false,
+          });
+        }
+
+        if (cancelled) { segmenter.close(); return; }
+        segmenterRef.current = segmenter;
+        setSegmenterReady(true);
+      } catch (err) {
+        console.error("Failed to initialize MediaPipe segmenter:", err);
+        if (!cancelled) setSegmenterError(err.message || "Segmenter failed to load");
+      }
+    }
+
+    init();
+    return () => {
+      cancelled = true;
+      if (segmenterRef.current) { segmenterRef.current.close(); segmenterRef.current = null; }
+    };
+  }, []);
+
+  return { segmenterRef, segmenterReady, segmenterError };
+}
+
+// ─── WebGL2 Compositing Renderer ──────────────────────────────
+
+const VERT_SRC = `#version 300 es
+in vec2 a_pos;
+in vec2 a_uv;
+out vec2 v_uv;
+void main() {
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+  v_uv = a_uv;
+}`;
+
+const FRAG_SRC = `#version 300 es
+precision highp float;
+uniform sampler2D u_video;
+uniform sampler2D u_mask;
+uniform sampler2D u_bg;
+uniform int u_mode;
+uniform vec2 u_texelSize;
+uniform vec2 u_maskTexelSize;
+in vec2 v_uv;
+out vec4 fragColor;
+void main() {
+  vec4 vid = texture(u_video, v_uv);
+  if (u_mode == 0) { fragColor = vid; return; }
+
+  // ── Morphological dilation (3×3 max-pool in mask space) ──────────────────
+  // Expands the person region by 1 mask pixel, closing sub-pixel gaps in thin
+  // features (hair strands, fingers) to reduce background bleed-through.
+  float mDilate = 0.0;
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+      mDilate = max(mDilate, texture(u_mask, v_uv + vec2(float(dx), float(dy)) * u_maskTexelSize).r);
+    }
+  }
+
+  // ── Gaussian blur on mask (5×5 in mask space) — edge feathering ──────────
+  // Spreads the mask boundary over ~5 mask pixels (~10 video pixels), turning
+  // the hard segmentation boundary into a smooth compositing alpha channel.
+  const float gw[5] = float[](0.0625, 0.25, 0.375, 0.25, 0.0625);
+  float mBlur = 0.0;
+  for (int dy = -2; dy <= 2; dy++) {
+    for (int dx = -2; dx <= 2; dx++) {
+      mBlur += texture(u_mask, v_uv + vec2(float(dx), float(dy)) * u_maskTexelSize).r * gw[dx+2] * gw[dy+2];
+    }
+  }
+  // Merge dilation into blur: raise alpha slightly in dilated areas so fine
+  // foreground detail (hair tips) is not fully lost to Gaussian weighting.
+  float mFeat = max(mBlur, mDilate * 0.12);
+
+  // ── Guided filter (5×5 mask space) — snap edges to video colour boundaries ─
+  // Fits a local linear model (a·I + b) between mask P and luminance guide I.
+  // Bends the composite edge to follow actual colour gradients in the video
+  // frame, preventing it from bisecting a uniform-coloured surface.
+  float guide = dot(vid.rgb, vec3(0.299, 0.587, 0.114));
+  float sI = 0.0, sP = 0.0, sIP = 0.0, sII = 0.0;
+  for (int dy = -2; dy <= 2; dy++) {
+    for (int dx = -2; dx <= 2; dx++) {
+      vec2 uv2 = v_uv + vec2(float(dx), float(dy)) * u_maskTexelSize;
+      float I = dot(texture(u_video, uv2).rgb, vec3(0.299, 0.587, 0.114));
+      float P = texture(u_mask, uv2).r;
+      sI += I; sP += P; sIP += I * P; sII += I * I;
+    }
+  }
+  float n = 25.0;
+  float mI = sI / n, mP = sP / n;
+  float a = (sIP / n - mI * mP) / (sII / n - mI * mI + 0.02);
+  float b = mP - a * mI;
+  float mGuided = clamp(a * guide + b, 0.0, 1.0);
+
+  // ── Composite ─────────────────────────────────────────────────────────────
+  // 60 % guided (colour-boundary snapping) + 40 % Gaussian feather (soft edges).
+  float m = mix(mFeat, mGuided, 0.6);
+  m = smoothstep(0.15, 0.85, m);
+
+  vec4 bg = texture(u_bg, v_uv);
+  fragColor = mix(bg, vid, m);
+}`;
+
+function compileShader(gl, src, type) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error("Shader compile error:", gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+
+function createGLTexture(gl, filter) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  return tex;
+}
+
+function initWebGL(gl) {
+  // LINEAR filtering on mask gives bilinear interpolation; the joint bilateral
+  // shader filter prevents this from creating halo at color-discontinuity edges.
+  const hasFloatLinear = gl.getExtension("OES_texture_float_linear");
+  const maskFilter = hasFloatLinear ? gl.LINEAR : gl.NEAREST;
+
+  // Compile shaders & link program
+  const vs = compileShader(gl, VERT_SRC, gl.VERTEX_SHADER);
+  const fs = compileShader(gl, FRAG_SRC, gl.FRAGMENT_SHADER);
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error("Program link error:", gl.getProgramInfoLog(program));
+  }
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+
+  // Fullscreen quad: positions + UVs (TRIANGLE_STRIP)
+  // UV Y is flipped so video isn't upside-down
+  const verts = new Float32Array([
+    -1, -1, 0, 1,
+     1, -1, 1, 1,
+    -1,  1, 0, 0,
+     1,  1, 1, 0,
+  ]);
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(program, "a_pos");
+  const aUv = gl.getAttribLocation(program, "a_uv");
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 16, 0);
+  gl.vertexAttribPointer(aUv, 2, gl.FLOAT, false, 16, 8);
+  gl.enableVertexAttribArray(aPos);
+  gl.enableVertexAttribArray(aUv);
+  gl.bindVertexArray(null);
+
+  // Textures
+  const videoTex = createGLTexture(gl, gl.LINEAR);
+  const maskTex = createGLTexture(gl, maskFilter);
+  const bgTex = createGLTexture(gl, gl.LINEAR);
+  // Dark fallback so unloaded backgrounds don't show garbage
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([26, 26, 46, 255]));
+
+  // Cache uniform locations
+  gl.useProgram(program);
+  const uniforms = {
+    u_video: gl.getUniformLocation(program, "u_video"),
+    u_mask: gl.getUniformLocation(program, "u_mask"),
+    u_bg: gl.getUniformLocation(program, "u_bg"),
+    u_mode: gl.getUniformLocation(program, "u_mode"),
+    u_texelSize: gl.getUniformLocation(program, "u_texelSize"),
+  };
+  // Bind texture units once (they never change)
+  gl.uniform1i(uniforms.u_video, 0);
+  gl.uniform1i(uniforms.u_mask, 1);
+  gl.uniform1i(uniforms.u_bg, 2);
+
+  // Set mask texel size once — mask is always SEG_WIDTH×SEG_HEIGHT regardless
+  // of the video resolution, so this is a true constant for the shader.
+  const u_maskTexelSizeLoc = gl.getUniformLocation(program, "u_maskTexelSize");
+  gl.uniform2f(u_maskTexelSizeLoc, 1.0 / SEG_WIDTH, 1.0 / SEG_HEIGHT);
+
+  return { program, vao, buf, textures: { video: videoTex, mask: maskTex, bg: bgTex }, uniforms };
+}
+
+// ─── WebGL background compositing with ML segmentation ────────
+function useBackgroundEffect(videoRef, canvasRef, selectedBg, segmenterRef, segmenterReady, uploadedImage, bgImagesRef) {
+  // Refs to track changing values without re-running the effect
+  const selectedBgRef = useRef(selectedBg);
+  const segmenterReadyRef = useRef(segmenterReady);
+  const uploadedImageRef = useRef(uploadedImage);
+  selectedBgRef.current = selectedBg;
+  segmenterReadyRef.current = segmenterReady;
+  uploadedImageRef.current = uploadedImage;
+
+  const rendererRef = useRef(null);
+  const blurCanvasRef = useRef(null);
+  const blurCtxRef = useRef(null);
+  const lastTimeRef = useRef(0);
+  const animFrameRef = useRef(null);
+  const lastDimsRef = useRef({ w: 0, h: 0 });
+  const lastBgKeyRef = useRef(null);
+  const frameCountRef = useRef(0);
+  const maskAllocRef = useRef({ w: 0, h: 0 });
+  const hasMaskRef = useRef(false);
+  const segCanvasRef = useRef(null);
+  const segCtxRef = useRef(null);
+  const blendMaskRef = useRef(null);
+  const avgFrameTimeRef = useRef(16);
+  const skipIntervalRef = useRef(2);
+
+  // Initialize WebGL once, draw loop reads from refs
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const gl = canvas.getContext("webgl2", { preserveDrawingBuffer: true, antialias: false, alpha: false });
+    if (!gl) { console.error("WebGL2 not supported"); return; }
+    rendererRef.current = initWebGL(gl);
+
+    blurCanvasRef.current = document.createElement("canvas");
+    blurCtxRef.current = blurCanvasRef.current.getContext("2d");
+
+    // Small canvas for downscaled segmentation input
+    const segCanvas = document.createElement("canvas");
+    segCanvas.width = SEG_WIDTH;
+    segCanvas.height = SEG_HEIGHT;
+    segCanvasRef.current = segCanvas;
+    segCtxRef.current = segCanvas.getContext("2d");
 
     const draw = () => {
-      const ctx = ctxRef.current;
-      if (!ctx || video.paused || video.ended) {
+      const video = videoRef.current;
+      if (!gl || !video || video.paused || video.ended) {
         animFrameRef.current = requestAnimationFrame(draw);
         return;
       }
 
-      canvas.width = video.videoWidth || 640;
-      canvas.height = video.videoHeight || 480;
+      const w = video.videoWidth || 640;
+      const h = video.videoHeight || 480;
+      const r = rendererRef.current;
+      const curBg = selectedBgRef.current;
+      const curReady = segmenterReadyRef.current;
+      const curUploaded = uploadedImageRef.current;
 
-      if (selectedBg === "none") {
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      } else if (selectedBg === "blur") {
-        ctx.filter = "blur(12px)";
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        ctx.filter = "none";
-        ctx.save();
-        ctx.beginPath();
-        ctx.ellipse(canvas.width / 2, canvas.height / 2, canvas.width * 0.32, canvas.height * 0.45, 0, 0, Math.PI * 2);
-        ctx.clip();
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        ctx.restore();
-      } else {
-        const bg = BACKGROUNDS.find((b) => b.id === selectedBg);
-        if (bg?.color) {
-          if (bg.color.startsWith("linear")) {
-            const grd = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
-            grd.addColorStop(0, bg.color.match(/#[a-f0-9]{6}/gi)?.[0] || "#333");
-            grd.addColorStop(1, bg.color.match(/#[a-f0-9]{6}/gi)?.[1] || "#666");
-            ctx.fillStyle = grd;
-          } else {
-            ctx.fillStyle = bg.color;
+      // Resize only when dimensions change
+      if (lastDimsRef.current.w !== w || lastDimsRef.current.h !== h) {
+        canvas.width = w;
+        canvas.height = h;
+        gl.viewport(0, 0, w, h);
+        gl.useProgram(r.program);
+        gl.uniform2f(r.uniforms.u_texelSize, 1.0 / w, 1.0 / h);
+        lastDimsRef.current = { w, h };
+      }
+
+      // Upload video texture
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, r.textures.video);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+
+      // "none" mode or segmenter not ready — passthrough video
+      if (curBg === "none" || !curReady || !segmenterRef.current) {
+        gl.useProgram(r.program);
+        gl.uniform1i(r.uniforms.u_mode, 0);
+        gl.bindVertexArray(r.vao);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        animFrameRef.current = requestAnimationFrame(draw);
+        return;
+      }
+
+      // Run ML segmentation on a downscaled canvas at adaptive intervals.
+      // 1280×720 → 640×360 = 4× fewer pixels. Skip interval adapts to device (1–4 frames).
+      frameCountRef.current++;
+      const shouldSegment = frameCountRef.current % skipIntervalRef.current === 0;
+
+      if (shouldSegment) {
+        const segStart = performance.now();
+        const timestamp = segStart > lastTimeRef.current ? segStart : lastTimeRef.current + 1;
+        lastTimeRef.current = timestamp;
+
+        // Draw video to small canvas for fast segmentation
+        segCtxRef.current.drawImage(video, 0, 0, SEG_WIDTH, SEG_HEIGHT);
+
+        let mask = null;
+        try {
+          const result = segmenterRef.current.segmentForVideo(segCanvasRef.current, timestamp);
+          if (result.confidenceMasks?.length > 0) {
+            mask = result.confidenceMasks[0].getAsFloat32Array();
           }
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-          ctx.save();
-          ctx.beginPath();
-          ctx.ellipse(canvas.width / 2, canvas.height / 2, canvas.width * 0.32, canvas.height * 0.45, 0, 0, Math.PI * 2);
-          ctx.clip();
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          ctx.restore();
-        } else {
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        } catch { /* fall through */ }
+
+        if (mask) {
+          // Motion-aware temporal blending: adapts smoothing to movement.
+          // Fast motion → more current mask (less ghosting).
+          // Slow/no motion → more blending (less flicker).
+          const prev = blendMaskRef.current;
+          const hasPrev = prev && prev.length === mask.length;
+          if (!hasPrev) {
+            blendMaskRef.current = new Float32Array(mask);
+          } else {
+            let diff = 0;
+            for (let i = 0; i < mask.length; i += 16) {
+              diff += Math.abs(mask[i] - prev[i]);
+            }
+            diff /= (mask.length >> 4);
+            const alpha = Math.min(0.92, 0.6 + diff * 4.0);
+            const blend = blendMaskRef.current;
+            for (let i = 0; i < mask.length; i++) {
+              blend[i] = mask[i] * alpha + blend[i] * (1.0 - alpha);
+            }
+          }
+
+          gl.activeTexture(gl.TEXTURE1);
+          gl.bindTexture(gl.TEXTURE_2D, r.textures.mask);
+          if (maskAllocRef.current.w !== SEG_WIDTH || maskAllocRef.current.h !== SEG_HEIGHT) {
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, SEG_WIDTH, SEG_HEIGHT, 0, gl.RED, gl.FLOAT, blendMaskRef.current);
+            maskAllocRef.current = { w: SEG_WIDTH, h: SEG_HEIGHT };
+          } else {
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, SEG_WIDTH, SEG_HEIGHT, gl.RED, gl.FLOAT, blendMaskRef.current);
+          }
+          hasMaskRef.current = true;
+        }
+
+        // Adaptive load management: adjust segmentation frequency based on cost
+        const segTime = performance.now() - segStart;
+        const avg = avgFrameTimeRef.current = avgFrameTimeRef.current * 0.9 + segTime * 0.1;
+        if (avg > 18 && skipIntervalRef.current < 4) skipIntervalRef.current++;
+        else if (avg < 8 && skipIntervalRef.current > 1) skipIntervalRef.current--;
+      }
+
+      // No valid mask yet — passthrough until first segmentation completes
+      if (!hasMaskRef.current) {
+        gl.useProgram(r.program);
+        gl.uniform1i(r.uniforms.u_mode, 0);
+        gl.bindVertexArray(r.vao);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        animFrameRef.current = requestAnimationFrame(draw);
+        return;
+      }
+
+      // Upload background texture
+      const bg = BACKGROUNDS.find((b) => b.id === curBg);
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, r.textures.bg);
+
+      if (bg?.type === "blur") {
+        // Update blur background every frame at half resolution for smooth motion.
+        // Half-res (w/2 × h/2) gives 4× fewer pixels than full-res while retaining
+        // much better quality than quarter-res; the CSS blur radius is halved
+        // proportionally so the effective visual blur stays at bg.blurPx video pixels.
+        const bw = Math.round(w / 2), bh = Math.round(h / 2);
+        const bc = blurCanvasRef.current, bctx = blurCtxRef.current;
+        if (bc.width !== bw || bc.height !== bh) { bc.width = bw; bc.height = bh; }
+        bctx.filter = `blur(${Math.max(1, Math.round(bg.blurPx / 2))}px)`;
+        bctx.drawImage(video, 0, 0, bw, bh);
+        bctx.filter = "none";
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bc);
+        lastBgKeyRef.current = null;
+      } else if (bg?.type === "image") {
+        const img = bgImagesRef?.current?.[bg.id];
+        if (img && lastBgKeyRef.current !== bg.id) {
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+          lastBgKeyRef.current = bg.id;
+        }
+      } else if (bg?.type === "upload" && curUploaded) {
+        const key = "upload:" + curUploaded.src;
+        if (lastBgKeyRef.current !== key) {
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, curUploaded);
+          lastBgKeyRef.current = key;
         }
       }
+
+      // Draw composite — single GPU draw call
+      gl.useProgram(r.program);
+      gl.uniform1i(r.uniforms.u_mode, 1);
+      gl.bindVertexArray(r.vao);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
       animFrameRef.current = requestAnimationFrame(draw);
     };
@@ -76,8 +438,16 @@ function useBackgroundEffect(videoRef, canvasRef, selectedBg) {
     draw();
     return () => {
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      if (rendererRef.current && gl) {
+        gl.deleteProgram(rendererRef.current.program);
+        gl.deleteBuffer(rendererRef.current.buf);
+        Object.values(rendererRef.current.textures).forEach((t) => gl.deleteTexture(t));
+        gl.deleteVertexArray(rendererRef.current.vao);
+        rendererRef.current = null;
+      }
     };
-  }, [selectedBg, videoRef, canvasRef]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoRef, canvasRef]);
 }
 
 // ─── Shared Components ──────────────────────────────────────
@@ -120,17 +490,30 @@ function RecordScreen({ onNext, onBack }) {
   const streamRef = useRef(null);
   const chunksRef = useRef([]);
   const timerRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   const [phase, setPhase] = useState("setup");
   const [countdown, setCountdown] = useState(3);
   const [elapsed, setElapsed] = useState(0);
-  const [selectedBg, setSelectedBg] = useState("none");
+  const [selectedBg, setSelectedBg] = useState("living-room");
   const [recordedBlob, setRecordedBlob] = useState(null);
   const [recordedUrl, setRecordedUrl] = useState(null);
   const [cameraReady, setCameraReady] = useState(false);
   const [cameraError, setCameraError] = useState(null);
+  const [uploadedImage, setUploadedImage] = useState(null);
 
-  useBackgroundEffect(videoRef, canvasRef, selectedBg);
+  const bgImagesRef = useRef({});
+  const { segmenterRef, segmenterReady, segmenterError } = useSegmenter();
+  useBackgroundEffect(videoRef, canvasRef, selectedBg, segmenterRef, segmenterReady, uploadedImage, bgImagesRef);
+
+  // Preload preset background images
+  useEffect(() => {
+    BACKGROUNDS.filter((bg) => bg.type === "image" && bg.src).forEach((bg) => {
+      const img = new Image();
+      img.onload = () => { bgImagesRef.current[bg.id] = img; };
+      img.src = bg.src;
+    });
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -220,6 +603,20 @@ function RecordScreen({ onNext, onBack }) {
     }
   };
 
+  const handleImageUpload = useCallback((e) => {
+    const file = e.target.files?.[0];
+    if (!file || !file.type.startsWith("image/")) return;
+    if (uploadedImage?.src?.startsWith("blob:")) {
+      URL.revokeObjectURL(uploadedImage.src);
+    }
+    const img = new Image();
+    img.onload = () => {
+      setUploadedImage(img);
+      setSelectedBg("upload");
+    };
+    img.src = URL.createObjectURL(file);
+  }, [uploadedImage]);
+
   const progress = (elapsed / MAX_DURATION) * 100;
 
   return (
@@ -235,14 +632,20 @@ function RecordScreen({ onNext, onBack }) {
       {/* Camera view */}
       <div style={styles.cameraView} className="camera-view">
         <video ref={videoRef} style={styles.hiddenVideo} muted playsInline />
-        {phase !== "preview" ? (
-          <canvas ref={canvasRef} style={styles.cameraFeed} />
-        ) : (
+        <canvas ref={canvasRef} style={{ ...styles.cameraFeed, display: phase === "preview" ? "none" : "block" }} />
+        {phase === "preview" && (
           <video src={recordedUrl} style={styles.cameraFeed} controls autoPlay loop />
         )}
 
         {cameraError && (
           <div style={styles.cameraErrorOverlay}>{cameraError}</div>
+        )}
+
+        {!segmenterReady && !segmenterError && selectedBg !== "none" && phase !== "preview" && (
+          <div style={styles.segmenterLoadingOverlay}>
+            <span style={styles.segmenterLoadingDot} />
+            <span style={styles.segmenterLoadingLabel}>Loading AI background...</span>
+          </div>
         )}
 
         {phase === "countdown" && (
@@ -269,22 +672,53 @@ function RecordScreen({ onNext, onBack }) {
         {/* Background picker in setup */}
         {phase === "setup" && (
           <div style={styles.bgSection} className="bg-section">
-            <p style={styles.bgTitle}>Choose your background</p>
+            <p style={styles.bgTitle}>
+              Choose your background
+              {!segmenterReady && !segmenterError && (
+                <span style={styles.segmenterLoadingText}> (AI loading...)</span>
+              )}
+            </p>
             <div style={styles.bgThumbs} className="bg-thumbs">
               {BACKGROUNDS.map((bg) => (
                 <button
                   key={bg.id}
-                  onClick={() => setSelectedBg(bg.id)}
+                  onClick={() => {
+                    if (bg.type === "upload") {
+                      fileInputRef.current?.click();
+                    } else {
+                      setSelectedBg(bg.id);
+                    }
+                  }}
                   style={{
                     ...styles.bgThumb,
-                    background: bg.preview,
+                    background: bg.id === "upload" && uploadedImage
+                      ? `url(${uploadedImage.src}) center/cover`
+                      : bg.type === "image" && bg.src
+                      ? `url(${bg.src}) center/cover`
+                      : bg.preview,
                     ...(selectedBg === bg.id ? styles.bgThumbActive : {}),
                   }}
                   className="bg-thumb"
                   title={bg.label}
-                />
+                >
+                  {bg.type === "upload" && !uploadedImage && (
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+                      stroke="rgba(255,255,255,0.6)" strokeWidth="2"
+                      strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="12" y1="5" x2="12" y2="19" />
+                      <line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                  )}
+                </button>
               ))}
             </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleImageUpload}
+              style={{ display: "none" }}
+            />
           </div>
         )}
 
@@ -673,6 +1107,39 @@ const styles = {
     textAlign: "center",
   },
 
+  // ─── Segmenter loading
+  segmenterLoadingOverlay: {
+    position: "absolute",
+    top: 16,
+    right: 16,
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "6px 14px",
+    background: "rgba(0,0,0,0.5)",
+    borderRadius: 20,
+    backdropFilter: "blur(8px)",
+    zIndex: 5,
+  },
+  segmenterLoadingDot: {
+    width: 8,
+    height: 8,
+    borderRadius: "50%",
+    background: "#ffa726",
+    animation: "pulse 1.5s infinite",
+  },
+  segmenterLoadingLabel: {
+    fontSize: 11,
+    fontWeight: 500,
+    color: "rgba(255,255,255,0.7)",
+  },
+  segmenterLoadingText: {
+    fontSize: 11,
+    fontWeight: 400,
+    color: "rgba(255,255,255,0.35)",
+    fontStyle: "italic",
+  },
+
   // ─── Recording indicator
   recIndicator: {
     position: "absolute",
@@ -766,6 +1233,11 @@ const styles = {
     transition: "all 0.15s",
     padding: 0,
     flexShrink: 0,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundSize: "cover",
+    backgroundPosition: "center",
   },
   bgThumbActive: {
     border: "2px solid #fff",
