@@ -235,9 +235,8 @@ function RecordScreen({ onNext, onBack }) {
       {/* Camera view */}
       <div style={styles.cameraView} className="camera-view">
         <video ref={videoRef} style={styles.hiddenVideo} muted playsInline />
-        {phase !== "preview" ? (
-          <canvas ref={canvasRef} style={styles.cameraFeed} />
-        ) : (
+        <canvas ref={canvasRef} style={{ ...styles.cameraFeed, display: phase === "preview" ? "none" : "block" }} />
+        {phase === "preview" && (
           <video src={recordedUrl} style={styles.cameraFeed} controls autoPlay loop />
         )}
 
