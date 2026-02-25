@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { supabase, VIDEOS_BUCKET } from "./supabase";
 
 const GRADIENT_BG = "linear-gradient(155deg, #0a1628 0%, #162052 20%, #3b1760 45%, #7b1a5e 70%, #c2185b 95%)";
 
@@ -1061,39 +1062,56 @@ export default function App() {
     uploadVideo(recordedBlob, emailValue);
   };
 
-  const uploadVideo = (blob, emailValue) => {
+  const uploadVideo = async (blob, emailValue) => {
     setUploadProgress(0);
     setUploadError("");
 
-    const formData = new FormData();
-    formData.append("video", blob, "testimonial.webm");
-    formData.append("email", emailValue);
+    // Simulated progress while waiting for real upload events
+    let sim = 0;
+    const simInterval = setInterval(() => {
+      sim = Math.min(sim + Math.random() * 5, 80);
+      setUploadProgress(sim);
+    }, 350);
 
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/upload");
+    try {
+      const filename = `testimonial-${Date.now()}-${Math.round(Math.random() * 1e9)}.webm`;
 
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) setUploadProgress((e.loaded / e.total) * 100);
-    };
+      // Upload video to Supabase Storage
+      const { error: storageError } = await supabase.storage
+        .from(VIDEOS_BUCKET)
+        .upload(filename, blob, {
+          contentType: "video/webm",
+          upsert: false,
+          onUploadProgress: (progress) => {
+            clearInterval(simInterval);
+            setUploadProgress((progress.loaded / progress.total) * 85);
+          },
+        });
 
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        setUploadProgress(100);
-        setTimeout(() => setScreen("success"), 400);
-      } else {
-        let msg = "Upload failed. Please try again.";
-        try { const r = JSON.parse(xhr.responseText); if (r.error) msg = r.error; } catch (e) { /* ignore */ }
-        setUploadError(msg);
-        setScreen("email");
-      }
-    };
+      if (storageError) throw storageError;
 
-    xhr.onerror = () => {
-      setUploadError("Network error. Please try again.");
+      clearInterval(simInterval);
+      setUploadProgress(90);
+
+      // Build public URL
+      const { data: { publicUrl } } = supabase.storage
+        .from(VIDEOS_BUCKET)
+        .getPublicUrl(filename);
+
+      // Save metadata to the testimonials table
+      const { error: dbError } = await supabase
+        .from("testimonials")
+        .insert({ email: emailValue, filename, video_url: publicUrl });
+
+      if (dbError) throw dbError;
+
+      setUploadProgress(100);
+      setTimeout(() => setScreen("success"), 400);
+    } catch (err) {
+      clearInterval(simInterval);
+      setUploadError(err.message || "Upload failed. Please try again.");
       setScreen("email");
-    };
-
-    xhr.send(formData);
+    }
   };
 
   const handleReset = () => {
