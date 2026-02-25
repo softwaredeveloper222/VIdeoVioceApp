@@ -13,11 +13,10 @@ const SEG_WIDTH = 256;
 const SEG_HEIGHT = 144;
 
 const BACKGROUNDS = [
-  { id: "none", label: "None", type: "none", preview: "#1a1a2e" },
+  { id: "none", label: "None", type: "none", preview: "#ffffff" },
   { id: "living-room", label: "Living Room", type: "image", src: "/backgrounds/living-room.jpg", preview: "linear-gradient(135deg, #c8956a, #f0ebe0)" },
   { id: "home-office", label: "Home Office", type: "image", src: "/backgrounds/home-office.jpg", preview: "linear-gradient(135deg, #7a9ab0, #e8ecf0)" },
-  { id: "library", label: "Library", type: "image", src: "/backgrounds/library.jpg", preview: "linear-gradient(135deg, #7a5c3c, #c8a050)" },
-  { id: "cafe", label: "Cafe", type: "image", src: "/backgrounds/cafe.jpg", preview: "linear-gradient(135deg, #b07850, #e8d090)" },
+  { id: "library", label: "Library", type: "image", src: "/backgrounds/library.jpg", preview: "linear-gradient(135deg, #7a5c3c, #c8a050)" },  
   { id: "upload", label: "Custom", type: "upload", preview: "linear-gradient(135deg, #333, #666)" },
 ];
 
